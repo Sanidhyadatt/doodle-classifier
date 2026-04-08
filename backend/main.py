@@ -1264,6 +1264,65 @@ def quickdraw_classes(current_user: sqlite3.Row = Depends(get_current_user)) -> 
     return {"classes": classes}
 
 
+@fastapi_app.get("/training/recommendation")
+def training_recommendation(current_user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    user_id = int(current_user["id"])
+
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT class_name, COUNT(*) AS sample_count
+            FROM training_samples
+            WHERE user_id = ?
+            GROUP BY class_name
+            ORDER BY class_name ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    trained_counts = {str(row["class_name"]): int(row["sample_count"]) for row in rows}
+    trained_classes = set(trained_counts.keys())
+    trained_class_count = len(trained_classes)
+
+    try:
+        quickdraw_classes_list = get_quickdraw_classes(QUICKDRAW_CACHE_DIR)
+    except Exception:
+        quickdraw_classes_list = []
+
+    if quickdraw_classes_list:
+        untrained = [name for name in quickdraw_classes_list if name not in trained_classes]
+        if untrained:
+            suggested = untrained[0]
+            return {
+                "class_name": suggested,
+                "reason": "Recommended because you have not trained this QuickDraw class yet.",
+                "trained_class_count": trained_class_count,
+            }
+
+        # All known classes are trained, so suggest reinforcing the weakest one.
+        if trained_counts:
+            weakest_class = min(trained_counts.items(), key=lambda item: item[1])[0]
+            return {
+                "class_name": weakest_class,
+                "reason": "All classes are unlocked. Reinforce this class with more samples for better accuracy.",
+                "trained_class_count": trained_class_count,
+            }
+
+    if trained_counts:
+        weakest_class = min(trained_counts.items(), key=lambda item: item[1])[0]
+        return {
+            "class_name": weakest_class,
+            "reason": "QuickDraw catalog unavailable. Reinforce this class using more drawings.",
+            "trained_class_count": trained_class_count,
+        }
+
+    return {
+        "class_name": "cat",
+        "reason": "Start by training a simple object to bootstrap your personal model.",
+        "trained_class_count": 0,
+    }
+
+
 @fastapi_app.post("/quickdraw/train")
 def quickdraw_train(
     payload: QuickDrawTrainRequest,
