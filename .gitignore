@@ -40,6 +40,22 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# models
-backend/data/*
-backend/models/*
+# models and training artifacts
+models/
+backend/models/
+backend/data/
+
+# common ML output files
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+*.pkl
+*.joblib
+
+# experiment/training logs
+runs/
+wandb/
+mlruns/
+tensorboard/
