@@ -12,6 +12,8 @@ from pydantic import BaseModel
 import aiohttp
 import asyncio
 import uuid
+import hashlib
+import hmac
 
 from backend.ml.model_manager import NeuroModel
 from backend.ml.extractor import extract_features
@@ -131,11 +133,25 @@ class DashboardData(BaseModel):
 
 
 # ============================================================================
-# Authentication (basic, no hashing for demo)
+# Authentication (proper password hashing)
 # ============================================================================
+# Secret key for password hashing (in production, use environment variable)
+SECRET_KEY = os.environ.get("SECRET_KEY", "demo-secret-key-change-in-production")
+
 def hash_password(password: str) -> str:
-    """Simple hash for demo (use bcrypt in production!)"""
-    return str(hash(password))
+    """Hash password using SHA-256 with HMAC for security and determinism."""
+    # Use HMAC-SHA256 for deterministic hashing with a secret key
+    return hmac.new(
+        SECRET_KEY.encode(),
+        password.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def verify_password(stored_hash: str, password: str) -> bool:
+    """Verify password against stored hash."""
+    return stored_hash == hash_password(password)
+
 
 
 def get_user_by_username(username: str) -> dict | None:
@@ -172,7 +188,7 @@ def verify_user(username: str, password: str) -> dict | None:
     cursor.execute("SELECT id, username, display_name, password_hash FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
     conn.close()
-    if row and row[3] == hash_password(password):
+    if row and verify_password(row[3], password):
         return {"id": row[0], "username": row[1], "display_name": row[2]}
     return None
 
