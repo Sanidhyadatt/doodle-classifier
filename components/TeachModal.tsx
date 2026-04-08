@@ -15,11 +15,17 @@ type TeachModalProps = {
   isOpen: boolean;
   onClose: () => void;
   onTrained?: (className: string) => void;
+  suggestedClassName?: string;
 };
 
 const TOTAL_DRAWINGS = 5;
 
-export default function TeachModal({ isOpen, onClose, onTrained }: TeachModalProps) {
+export default function TeachModal({
+  isOpen,
+  onClose,
+  onTrained,
+  suggestedClassName,
+}: TeachModalProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const [className, setClassName] = useState("");
@@ -55,7 +61,8 @@ export default function TeachModal({ isOpen, onClose, onTrained }: TeachModalPro
     setSamples([]);
     setErrorMessage(null);
     setToastMessage(null);
-  }, [initializeCanvas, isOpen]);
+    setClassName((suggestedClassName ?? "").trim());
+  }, [initializeCanvas, isOpen, suggestedClassName]);
 
   const clearCanvas = useCallback(() => {
     initializeCanvas();
@@ -197,6 +204,11 @@ export default function TeachModal({ isOpen, onClose, onTrained }: TeachModalPro
               onChange={(event) => setClassName(event.target.value)}
               className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-800 outline-none ring-indigo-200 focus:ring"
             />
+            {suggestedClassName ? (
+              <p className="mt-1 text-xs text-slate-500">
+                Recommended by system: {suggestedClassName}
+              </p>
+            ) : null}
           </label>
 
           <canvas

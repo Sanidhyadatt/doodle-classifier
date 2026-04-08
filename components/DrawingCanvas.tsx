@@ -22,10 +22,12 @@ type DrawingCanvasProps = {
   height?: number;
   className?: string;
   onStrokePoint?: (x: number, y: number) => void;
+  onClear?: () => void;
+  disabled?: boolean;
 };
 
 const DrawingCanvas = forwardRef<DrawingCanvasRef, DrawingCanvasProps>(
-  ({ width = 280, height = 280, className = "", onStrokePoint }, ref) => {
+  ({ width = 280, height = 280, className = "", onStrokePoint, onClear, disabled = false }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const [isDrawing, setIsDrawing] = useState(false);
     const lastRemotePointRef = useRef<{ x: number; y: number } | null>(null);
@@ -74,6 +76,8 @@ const DrawingCanvas = forwardRef<DrawingCanvasRef, DrawingCanvasProps>(
     };
 
     const startStroke = (x: number, y: number) => {
+      if (disabled) return;
+
       const canvas = canvasRef.current;
       if (!canvas) return;
 
@@ -86,7 +90,7 @@ const DrawingCanvas = forwardRef<DrawingCanvasRef, DrawingCanvasProps>(
     };
 
     const continueStroke = (x: number, y: number) => {
-      if (!isDrawing) return;
+      if (!isDrawing || disabled) return;
 
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -172,7 +176,7 @@ const DrawingCanvas = forwardRef<DrawingCanvasRef, DrawingCanvasProps>(
           ref={canvasRef}
           width={width}
           height={height}
-          className="touch-none rounded-lg border border-zinc-300 bg-white"
+          className={`touch-none rounded-lg border border-zinc-300 bg-white ${disabled ? "pointer-events-none opacity-70" : ""}`}
           onMouseDown={(event) => {
             const point = getPointFromMouse(event);
             startStroke(point.x, point.y);
@@ -202,8 +206,12 @@ const DrawingCanvas = forwardRef<DrawingCanvasRef, DrawingCanvasProps>(
 
         <button
           type="button"
-          onClick={clearCanvas}
-          className="self-start rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700"
+          onClick={() => {
+            clearCanvas();
+            onClear?.();
+          }}
+          disabled={disabled}
+          className="self-start rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-60"
         >
           Clear
         </button>

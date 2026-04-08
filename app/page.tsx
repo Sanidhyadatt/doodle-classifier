@@ -115,6 +115,14 @@ type AuthResponse = {
   dashboard: DashboardData;
 };
 
+type TrainingRecommendationResponse = {
+  class_name: string;
+  reason: string;
+  trained_class_count: number;
+};
+
+type PlayMode = "solo" | "multiplayer";
+
 function formatActivity(kind: string) {
   switch (kind) {
     case "register":
@@ -127,6 +135,12 @@ function formatActivity(kind: string) {
       return "Taught a new class";
     case "multiplayer":
       return "Entered a battle room";
+    case "multiplayer_guess":
+      return "Guessed the word";
+    case "multiplayer_round":
+      return "Started a new round";
+    case "multiplayer_leave":
+      return "Left a battle room";
     case "battle_guess":
       return "Broadcast an AI guess";
     default:
@@ -134,9 +148,47 @@ function formatActivity(kind: string) {
   }
 }
 
+type MultiplayerPlayer = {
+  user_id: number;
+  username: string;
+  display_name: string;
+  score: number;
+  is_drawer: boolean;
+};
+
+type MultiplayerRoomMessage = {
+  kind: string;
+  message: string;
+  guess?: string;
+  prediction?: string;
+  confidence?: number;
+  correct?: boolean;
+  user?: { display_name?: string; username?: string } | null;
+};
+
+type MultiplayerRoomState = {
+  room_id: string;
+  phase: "waiting" | "drawing" | "round_over";
+  round_number: number;
+  round_ends_at?: string | null;
+  drawer_display_name: string | null;
+  is_drawer: boolean;
+  can_draw: boolean;
+  can_guess: boolean;
+  prompt: string;
+  prompt_length: number;
+  seconds_left: number | null;
+  status: string;
+  players: MultiplayerPlayer[];
+  chat_history: MultiplayerRoomMessage[];
+  self: { user_id: number; display_name: string; username: string } | null;
+};
+
 function useSocketMessages(roomId: string | null, enabled: boolean) {
   const [messages, setMessages] = useState<string[]>([]);
   const [remoteStroke, setRemoteStroke] = useState<{ x: number; y: number } | null>(null);
+  const [clearSignal, setClearSignal] = useState(0);
+  const [roomState, setRoomState] = useState<MultiplayerRoomState | null>(null);
   const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
@@ -156,6 +208,15 @@ function useSocketMessages(roomId: string | null, enabled: boolean) {
     socket.on("connect", () => {
       socket.emit("join_room", { room_id: roomId });
       setMessages((prev) => [...prev, `Connected to ${roomId}`]);
+    });
+
+    socket.on("room_state", (payload: MultiplayerRoomState) => {
+      setRoomState(payload);
+    });
+
+    socket.on("room_event", (payload: MultiplayerRoomMessage) => {
+      const suffix = payload.kind === "guess" && payload.correct === false ? " (incorrect)" : "";
+      setMessages((prev) => [...prev, `${payload.message}${suffix}`]);
     });
 
     socket.on("ai_chat_message", (payload: {
@@ -193,8 +254,15 @@ function useSocketMessages(roomId: string | null, enabled: boolean) {
       }
     });
 
+    socket.on("clear_canvas", () => {
+      setRemoteStroke(null);
+      setClearSignal((value) => value + 1);
+    });
+
     socket.on("disconnect", () => {
       setMessages((prev) => [...prev, "Disconnected from server"]);
+      setRemoteStroke(null);
+      setRoomState(null);
     });
 
     return () => {
@@ -203,11 +271,12 @@ function useSocketMessages(roomId: string | null, enabled: boolean) {
     };
   }, [enabled, roomId]);
 
-  return { socketRef, messages, setMessages, remoteStroke };
+  return { socketRef, messages, setMessages, remoteStroke, clearSignal, roomState };
 }
 
 export default function Home() {
   const canvasRef = useRef<DrawingCanvasRef>(null);
+  const lastRoundRef = useRef<number | null>(null);
   const [session, setSession] = useState<DashboardData | null>(null);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [username, setUsername] = useState("");
@@ -229,14 +298,22 @@ export default function Home() {
   const [definition, setDefinition] = useState(
     "Log in to access the arena, then draw an object to begin training your personal model.",
   );
+  const [playMode, setPlayMode] = useState<PlayMode>("solo");
+  const [roomDraft, setRoomDraft] = useState(ARENA_ROOM_ID);
+  const [activeRoomId, setActiveRoomId] = useState(ARENA_ROOM_ID);
+  const [roomGuess, setRoomGuess] = useState("");
+  const [liveSecondsLeft, setLiveSecondsLeft] = useState<number | null>(null);
+  const [trainingSuggestion, setTrainingSuggestion] = useState<string>("");
+  const [trainingSuggestionReason, setTrainingSuggestionReason] = useState<string>("");
+  const [suggestionLoading, setSuggestionLoading] = useState(false);
   const [isSamplesModalOpen, setIsSamplesModalOpen] = useState(false);
   const [viewingClass, setViewingClass] = useState<string | null>(null);
   const [classSamples, setClassSamples] = useState<number[][][]>([]);
   const [samplesLoading, setSamplesLoading] = useState(false);
 
-  const { socketRef, messages, setMessages, remoteStroke } = useSocketMessages(
-    ARENA_ROOM_ID,
-    Boolean(session),
+  const { socketRef, messages, setMessages, remoteStroke, clearSignal, roomState } = useSocketMessages(
+    activeRoomId,
+    Boolean(session) && playMode === "multiplayer",
   );
 
   const refreshDashboard = useCallback(async (options?: { silent?: boolean }) => {
@@ -279,6 +356,49 @@ export default function Home() {
   }, [remoteStroke]);
 
   useEffect(() => {
+    if (clearSignal <= 0) return;
+    canvasRef.current?.clearCanvas();
+  }, [clearSignal]);
+
+  useEffect(() => {
+    if (!roomState) {
+      lastRoundRef.current = null;
+      canvasRef.current?.clearCanvas();
+      setLiveSecondsLeft(null);
+      return;
+    }
+
+    if (lastRoundRef.current !== roomState.round_number) {
+      canvasRef.current?.clearCanvas();
+      lastRoundRef.current = roomState.round_number;
+    }
+  }, [roomState]);
+
+  useEffect(() => {
+    if (!roomState || roomState.phase !== "drawing" || !roomState.round_ends_at) {
+      setLiveSecondsLeft(null);
+      return;
+    }
+
+    const computeSeconds = () => {
+      const endTime = new Date(roomState.round_ends_at ?? "").getTime();
+      if (Number.isNaN(endTime)) {
+        return null;
+      }
+      return Math.max(0, Math.floor((endTime - Date.now()) / 1000));
+    };
+
+    setLiveSecondsLeft(computeSeconds());
+    const intervalId = window.setInterval(() => {
+      setLiveSecondsLeft(computeSeconds());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [roomState]);
+
+  useEffect(() => {
     if (!session) return;
 
     const loadQuickDrawClasses = async () => {
@@ -301,6 +421,34 @@ export default function Home() {
 
     void loadQuickDrawClasses();
   }, [session, selectedQuickdrawClasses.length]);
+
+  const loadTrainingRecommendation = useCallback(async () => {
+    if (!session) return;
+
+    setSuggestionLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/training/recommendation`, {
+        credentials: "include",
+      });
+      if (!response.ok) {
+        throw new Error("Could not fetch recommendation");
+      }
+
+      const body = (await response.json()) as TrainingRecommendationResponse;
+      setTrainingSuggestion(body.class_name);
+      setTrainingSuggestionReason(body.reason);
+    } catch {
+      setTrainingSuggestion("");
+      setTrainingSuggestionReason("Recommendation unavailable right now.");
+    } finally {
+      setSuggestionLoading(false);
+    }
+  }, [session]);
+
+  useEffect(() => {
+    if (!session) return;
+    void loadTrainingRecommendation();
+  }, [loadTrainingRecommendation, session]);
 
   useEffect(() => {
     if (!toast) return;
@@ -371,6 +519,9 @@ export default function Home() {
     setLastGuessId(null);
     setConfidence(null);
     setDefinition("Log in to continue your arena run.");
+    setPlayMode("solo");
+    setRoomGuess("");
+    setActiveRoomId(ARENA_ROOM_ID);
     setToast("Logged out successfully");
   }, [setMessages, socketRef]);
 
@@ -381,10 +532,12 @@ export default function Home() {
     if (!pixels.length) return;
 
     setIsPredicting(true);
-    socketRef.current?.emit("trigger_ai_guess", {
-      room_id: ARENA_ROOM_ID,
-      pixel_data: pixels,
-    });
+    if (playMode === "multiplayer" && roomState?.phase === "drawing") {
+      socketRef.current?.emit("trigger_ai_guess", {
+        room_id: activeRoomId,
+        pixel_data: pixels,
+      });
+    }
 
     try {
       const response = await fetch(`${API_BASE}/predict`, {
@@ -424,32 +577,66 @@ export default function Home() {
     } finally {
       setIsPredicting(false);
     }
-  }, [refreshDashboard, session, socketRef]);
+  }, [activeRoomId, playMode, refreshDashboard, roomState?.phase, session, socketRef]);
 
   const handleMultiplayerBattle = useCallback(() => {
     if (!session) return;
-    socketRef.current?.emit("join_room", { room_id: ARENA_ROOM_ID });
-    setToast("Battle room joined");
-  }, [session, socketRef]);
+    const nextRoomId = roomDraft.trim() || ARENA_ROOM_ID;
+    setPlayMode("multiplayer");
+    setActiveRoomId(nextRoomId);
+    if (socketRef.current && activeRoomId === nextRoomId) {
+      socketRef.current.emit("join_room", { room_id: nextRoomId });
+    }
+    setToast(`Joining room ${nextRoomId}`);
+  }, [activeRoomId, roomDraft, session, socketRef]);
+
+  const handleSoloMode = useCallback(() => {
+    if (!session) return;
+    setPlayMode("solo");
+    setRoomGuess("");
+    setToast("Single player mode enabled");
+  }, [session]);
+
+  const handleRoomGuess = useCallback(() => {
+    if (!session || !roomState?.can_guess) return;
+    if (typeof liveSecondsLeft === "number" && liveSecondsLeft <= 0) return;
+
+    const guess = roomGuess.trim();
+    if (!guess) return;
+
+    socketRef.current?.emit("submit_guess", {
+      room_id: activeRoomId,
+      guess,
+    });
+    setRoomGuess("");
+  }, [activeRoomId, liveSecondsLeft, roomGuess, roomState?.can_guess, session, socketRef]);
 
   const handleStrokePoint = useCallback(
     (x: number, y: number) => {
-      if (!session) return;
+      if (!session || playMode !== "multiplayer" || !roomState?.can_draw) return;
       socketRef.current?.emit("draw_stroke", {
         x,
         y,
-        room_id: ARENA_ROOM_ID,
+        room_id: activeRoomId,
       });
     },
-    [session, socketRef],
+    [activeRoomId, playMode, roomState?.can_draw, session, socketRef],
   );
+
+  const handleCanvasClear = useCallback(() => {
+    if (!session) return;
+    if (playMode !== "multiplayer") return;
+    if (!roomState?.can_draw) return;
+    socketRef.current?.emit("clear_canvas", { room_id: activeRoomId });
+  }, [activeRoomId, playMode, roomState?.can_draw, session, socketRef]);
 
   const handleModalTrained = useCallback(
     (className: string) => {
       setToast(`Taught ${className}`);
       void refreshDashboard({ silent: true });
+      void loadTrainingRecommendation();
     },
-    [refreshDashboard],
+    [loadTrainingRecommendation, refreshDashboard],
   );
 
   const handleToggleQuickdrawClass = useCallback((className: string) => {
@@ -492,6 +679,13 @@ export default function Home() {
       setQuickdrawLoading(false);
     }
   }, [quickdrawSamples, selectedQuickdrawClasses, session]);
+
+  const handleTrainSuggested = useCallback(() => {
+    if (!trainingSuggestion) {
+      void loadTrainingRecommendation();
+    }
+    setIsTeachModalOpen(true);
+  }, [loadTrainingRecommendation, trainingSuggestion]);
 
   const handleGuessFeedback = useCallback(
     async (isCorrect: boolean) => {
@@ -578,7 +772,7 @@ export default function Home() {
   const authScreen = (
     <div className="min-h-screen px-4 py-8 text-slate-900">
       <div className="mx-auto grid min-h-[calc(100vh-4rem)] w-full max-w-6xl gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-        <section className="rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-[0_20px_80px_rgba(15,23,42,0.08)] backdrop-blur">
+        <section className="rounded-4xl border border-white/70 bg-white/90 p-8 shadow-[0_20px_80px_rgba(15,23,42,0.08)] backdrop-blur">
           <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-indigo-700">
             NeuroSketch Arena
           </div>
@@ -610,7 +804,7 @@ export default function Home() {
               ["Draw", "Guess or teach a sketch"],
               ["Battle", "Join the shared multiplayer room"],
             ].map(([title, text]) => (
-              <div key={title} className="rounded-2xl bg-gradient-to-br from-slate-900 to-indigo-900 p-4 text-white shadow-lg">
+              <div key={title} className="rounded-2xl bg-linear-to-br from-slate-900 to-indigo-900 p-4 text-white shadow-lg">
                 <p className="text-sm font-semibold uppercase tracking-[0.15em] text-indigo-200">{title}</p>
                 <p className="mt-3 text-sm text-slate-100/90">{text}</p>
               </div>
@@ -619,7 +813,7 @@ export default function Home() {
         </section>
 
         <section className="flex items-center">
-          <div className="w-full rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+          <div className="w-full rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
             <div className="flex items-center justify-between gap-3">
               <div>
                 <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
@@ -738,7 +932,7 @@ export default function Home() {
   const dashboardScreen = session ? (
     <div className="min-h-screen px-4 py-6 text-slate-900">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
-        <header className="rounded-[2rem] border border-white/70 bg-white/90 px-6 py-5 shadow-[0_20px_80px_rgba(15,23,42,0.08)] backdrop-blur">
+        <header className="rounded-4xl border border-white/70 bg-white/90 px-6 py-5 shadow-[0_20px_80px_rgba(15,23,42,0.08)] backdrop-blur">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-indigo-700">
@@ -774,7 +968,7 @@ export default function Home() {
             </div>
             <div className="h-3 rounded-full bg-slate-200">
               <div
-                className="h-3 rounded-full bg-gradient-to-r from-indigo-600 to-indigo-400 transition-all"
+                className="h-3 rounded-full bg-linear-to-r from-indigo-600 to-indigo-400 transition-all"
                 style={{ width: `${levelProgress}%` }}
               />
             </div>
@@ -787,6 +981,17 @@ export default function Home() {
               className="rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-semibold text-indigo-700 transition hover:bg-indigo-100"
             >
               Teach New Object
+            </button>
+            <button
+              type="button"
+              onClick={handleSoloMode}
+              className={`rounded-2xl px-4 py-2 text-sm font-semibold transition ${
+                playMode === "solo"
+                  ? "bg-emerald-600 text-white hover:bg-emerald-500"
+                  : "border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+              }`}
+            >
+              Single Player
             </button>
             <button
               type="button"
@@ -807,7 +1012,7 @@ export default function Home() {
 
         <main className="grid grid-cols-1 gap-6 xl:grid-cols-[1.1fr_0.9fr]">
           <section className="space-y-6">
-            <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+            <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
               <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
@@ -838,7 +1043,9 @@ export default function Home() {
                   width={440}
                   height={440}
                   className="w-full"
+                  disabled={playMode === "multiplayer" ? !roomState?.can_draw : false}
                   onStrokePoint={handleStrokePoint}
+                  onClear={handleCanvasClear}
                 />
 
                 <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -848,7 +1055,7 @@ export default function Home() {
                     disabled={isPredicting}
                     className="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-70"
                   >
-                    {isPredicting ? "Guessing..." : "Guess"}
+                    {isPredicting ? "Testing..." : "Test Model"}
                   </button>
                   <button
                     type="button"
@@ -862,18 +1069,49 @@ export default function Home() {
                     onClick={handleMultiplayerBattle}
                     className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
                   >
-                    Multiplayer Battle
+                    {playMode === "multiplayer" ? "Switch Room" : "Join Room"}
                   </button>
                 </div>
 
-                <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
-                  Draw with mouse or touch. Every stroke is broadcast to the arena room.
+                <div className="mt-4 grid gap-3 md:grid-cols-[1.2fr_0.8fr]">
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                    <p className="font-semibold text-slate-900">Mode</p>
+                    <p className="mt-1 text-slate-600">
+                      {playMode === "solo" ? "Single player training + testing" : `Multiplayer room: ${activeRoomId}`}
+                    </p>
+                    <p className="mt-3 leading-6">
+                      {playMode === "solo"
+                        ? "Draw freely, train classes from recommendations, and test your personal model without joining a room."
+                        : "Draw with mouse or touch. In multiplayer, the drawer rotates like Scribble.io and everyone else guesses the secret word."}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                    <p className="font-semibold text-slate-900">Prompt status</p>
+                    <p className="mt-1 text-slate-600">
+                      {playMode === "multiplayer"
+                        ? roomState
+                          ? `${roomState.phase} · round ${roomState.round_number}`
+                          : "Join a room to start a round."
+                        : "Prompts are recommendations in single-player mode."}
+                    </p>
+                    <p className="mt-3 leading-6">
+                      {playMode === "multiplayer"
+                        ? roomState?.can_draw
+                          ? `You are the drawer. Draw this word: ${roomState.prompt}`
+                          : roomState?.can_guess
+                            ? `You are guessing. Hint: ${roomState.prompt_length}-letter word (${roomState.prompt}).`
+                            : "Waiting for at least two players."
+                        : trainingSuggestion
+                          ? `Recommended training word: ${trainingSuggestion}`
+                          : "Use recommendation to start training."}
+                    </p>
+                  </div>
                 </div>
               </div>
             </article>
 
             <div className="grid gap-6 md:grid-cols-2">
-              <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+              <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
                 <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
                   Player Profile
                 </p>
@@ -899,7 +1137,7 @@ export default function Home() {
                 </div>
               </article>
 
-              <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+              <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
                 <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
                   Model Library
                 </p>
@@ -937,7 +1175,7 @@ export default function Home() {
           </section>
 
           <aside className="space-y-6">
-            <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+            <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
               <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
                 AI Results
               </p>
@@ -981,14 +1219,105 @@ export default function Home() {
               </div>
             </article>
 
-            <article className="flex min-h-80 flex-col rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+            <article className="flex min-h-80 flex-col rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
               <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
-                Multiplayer Chat
+                Multiplayer Room
               </p>
+              {playMode === "multiplayer" ? (
+                <>
+                  <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto]">
+                    <label className="block text-sm font-medium text-slate-700 sm:col-span-1">
+                      Room code
+                      <input
+                        value={roomDraft}
+                        onChange={(event) => setRoomDraft(event.target.value)}
+                        className="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm outline-none ring-indigo-200 focus:ring-4"
+                        placeholder="arena-lobby"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleMultiplayerBattle}
+                      className="self-end rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700"
+                    >
+                      Join / Create
+                    </button>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-2">
+                    <div className="rounded-2xl bg-slate-50 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                        Round
+                      </p>
+                      <p className="mt-2 text-2xl font-semibold text-slate-950">
+                        {roomState ? `#${roomState.round_number}` : "-"}
+                      </p>
+                      <p className="mt-2 text-sm text-slate-600">
+                        {roomState?.phase === "drawing"
+                          ? `Drawer: ${roomState.drawer_display_name ?? "Unknown"}`
+                          : roomState?.phase === "round_over"
+                            ? "Round over. Rotating to the next drawer."
+                            : "Waiting for players."}
+                      </p>
+                      <p className="mt-2 text-sm font-semibold text-indigo-700">
+                        {roomState?.phase === "drawing"
+                          ? `Time left: ${typeof liveSecondsLeft === "number" ? `${liveSecondsLeft}s` : "--"}`
+                          : "Timer inactive"}
+                      </p>
+                    </div>
+                    <div className="rounded-2xl bg-slate-50 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                        Secret prompt
+                      </p>
+                      <p className="mt-2 text-2xl font-semibold text-slate-950">
+                        {roomState?.prompt ?? "______"}
+                      </p>
+                      <p className="mt-2 text-sm text-slate-600">
+                        {roomState?.can_draw
+                          ? "Drawer sees full word here."
+                          : roomState?.can_guess
+                            ? `Word length hint: ${roomState?.prompt_length ?? 0} characters`
+                            : "Join players to start a round."}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto]">
+                    <input
+                      value={roomGuess}
+                      onChange={(event) => setRoomGuess(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          handleRoomGuess();
+                        }
+                      }}
+                      disabled={!roomState?.can_guess || (typeof liveSecondsLeft === "number" && liveSecondsLeft <= 0)}
+                      className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm outline-none ring-indigo-200 focus:ring-4 disabled:cursor-not-allowed disabled:bg-slate-100"
+                      placeholder={roomState?.can_guess
+                        ? (typeof liveSecondsLeft === "number" && liveSecondsLeft <= 0 ? "Time up for this round" : "Type your guess here")
+                        : "Waiting for the next round"}
+                    />
+                    <button
+                      type="button"
+                      onClick={handleRoomGuess}
+                      disabled={!roomState?.can_guess || roomGuess.trim().length === 0 || (typeof liveSecondsLeft === "number" && liveSecondsLeft <= 0)}
+                      className="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Send Guess
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+                  Multiplayer guessing is disabled in single-player mode. Switch to Multiplayer mode to join rooms and use Scribble-style guessing.
+                </div>
+              )}
+
               <div className="mt-4 flex-1 space-y-3 overflow-y-auto rounded-2xl border border-slate-200 bg-slate-50 p-4">
                 {messages.length === 0 ? (
                   <p className="text-sm text-slate-500">
-                    No battle messages yet. Join the room to start the duel.
+                    Join a room to start the draw-and-guess loop.
                   </p>
                 ) : (
                   messages.map((message, index) => (
@@ -998,9 +1327,35 @@ export default function Home() {
                   ))
                 )}
               </div>
+
+              <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                  Players
+                </p>
+                <div className="mt-3 space-y-2">
+                  {roomState?.players?.length ? (
+                    roomState.players.map((player) => (
+                      <div key={`${player.user_id}-${player.username}`} className="flex items-center justify-between rounded-xl bg-white px-3 py-2 text-sm text-slate-700 shadow-sm">
+                        <div>
+                          <p className="font-semibold text-slate-950">
+                            {player.display_name}
+                            {player.is_drawer ? " · drawing" : ""}
+                          </p>
+                          <p className="text-xs text-slate-500">@{player.username}</p>
+                        </div>
+                        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                          {player.score} pts
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-sm text-slate-500">No players in the room yet.</p>
+                  )}
+                </div>
+              </div>
             </article>
 
-            <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+            <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
               <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
                 Recent Activity
               </p>
@@ -1021,7 +1376,43 @@ export default function Home() {
         </main>
 
         <section className="grid gap-6 lg:grid-cols-2 xl:grid-cols-3">
-          <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] lg:col-span-2 xl:col-span-3">
+          <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] lg:col-span-2 xl:col-span-3">
+            <p className="text-sm font-semibold uppercase tracking-[0.2em] text-emerald-700">
+              Single Player Trainer
+            </p>
+            <p className="mt-2 text-sm text-slate-600">
+              Get a recommended class from the system, draw 5 samples, train, then test your model immediately without joining any room.
+            </p>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto_auto]">
+              <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-emerald-700">Recommended Class</p>
+                <p className="mt-2 text-2xl font-semibold text-emerald-900">
+                  {suggestionLoading ? "Loading..." : trainingSuggestion || "Unavailable"}
+                </p>
+                <p className="mt-2 text-sm text-emerald-800">
+                  {trainingSuggestionReason || "Use refresh to get a recommendation."}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadTrainingRecommendation()}
+                disabled={suggestionLoading}
+                className="rounded-2xl border border-emerald-300 bg-white px-4 py-3 text-sm font-semibold text-emerald-700 transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Refresh Suggestion
+              </button>
+              <button
+                type="button"
+                onClick={handleTrainSuggested}
+                className="rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-500"
+              >
+                Train Suggested Class
+              </button>
+            </div>
+          </article>
+
+          <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] lg:col-span-2 xl:col-span-3">
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
               QuickDraw Database Trainer
             </p>
@@ -1079,7 +1470,7 @@ export default function Home() {
             </div>
           </article>
 
-          <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+          <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
               Missions
             </p>
@@ -1112,7 +1503,7 @@ export default function Home() {
             </div>
           </article>
 
-          <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
+          <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)]">
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
               Leaderboard
             </p>
@@ -1134,7 +1525,7 @@ export default function Home() {
             </div>
           </article>
 
-          <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] lg:col-span-2 xl:col-span-1">
+          <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] lg:col-span-2 xl:col-span-1">
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
               Achievements
             </p>
@@ -1158,7 +1549,7 @@ export default function Home() {
             </div>
           </article>
 
-          <article className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] lg:col-span-2 xl:col-span-1">
+          <article className="rounded-4xl border border-slate-200 bg-white p-6 shadow-[0_20px_80px_rgba(15,23,42,0.08)] lg:col-span-2 xl:col-span-1">
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-indigo-700">
               Correct Guess History
             </p>
@@ -1191,6 +1582,7 @@ export default function Home() {
           isOpen={isTeachModalOpen}
           onClose={() => setIsTeachModalOpen(false)}
           onTrained={handleModalTrained}
+          suggestedClassName={trainingSuggestion}
         />
 
         {isSamplesModalOpen && (
