@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+numpy
+opencv-python
+scikit-image
+scikit-learn
+requests
+beautifulsoup4
+python-socketio
+pydantic
+aiohttp
