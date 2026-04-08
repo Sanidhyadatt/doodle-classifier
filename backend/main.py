@@ -122,8 +122,12 @@ class QuickDrawTrainRequest(BaseModel):
 
 class DashboardData(BaseModel):
     user: dict
-    predictions_count: int
-    training_count: int
+    leaderboard: list
+    missions: list
+    achievements: list
+    recent_activity: list
+    correct_guesses: list
+    model_status: dict
 
 
 # ============================================================================
@@ -291,23 +295,36 @@ async def register(req: RegisterRequest, response: Response):
         samesite="lax",
     )
     
-    # Get dashboard data
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM predictions WHERE user_id = ?", (user["id"],))
-    pred_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM training_logs WHERE user_id = ?", (user["id"],))
-    train_count = cursor.fetchone()[0]
-    conn.close()
+    # Build complete user profile
+    user_profile = {
+        **user,  # id, username, display_name
+        "xp": 0,
+        "coins": 0,
+        "level": 1,
+        "streak": 0,
+        "predictions_count": 0,
+        "training_count": 0,
+        "multiplayer_count": 0,
+        "wiki_lookups": 0,
+        "wins": 0,
+        "losses": 0,
+        "next_level_xp": 100,
+        "level_progress": 0,
+        "achievements": [],
+    }
     
     return {
         "message": f"Welcome to the Doodle Arena, {user['display_name']}!",
         "user": user,
-        "dashboard": {
-            "user": user,
-            "predictions_count": pred_count,
-            "training_count": train_count,
-        },
+        "dashboard": DashboardData(
+            user=user_profile,
+            leaderboard=[],
+            missions=[],
+            achievements=[],
+            recent_activity=[],
+            correct_guesses=[],
+            model_status={"ready": False, "classes": []},
+        ).model_dump(),
     }
 
 
@@ -326,23 +343,54 @@ async def login(req: LoginRequest, response: Response):
         samesite="lax",
     )
     
-    # Get dashboard data
+    # Get trained classes for model status
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
     cursor.execute("SELECT COUNT(*) FROM predictions WHERE user_id = ?", (user["id"],))
-    pred_count = cursor.fetchone()[0]
+    predictions_count = cursor.fetchone()[0]
+    
     cursor.execute("SELECT COUNT(*) FROM training_logs WHERE user_id = ?", (user["id"],))
-    train_count = cursor.fetchone()[0]
+    training_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT DISTINCT class_name FROM training_logs WHERE user_id = ?", (user["id"],))
+    trained_classes = [row[0] for row in cursor.fetchall()]
+    
     conn.close()
+    
+    # Build complete user profile
+    user_profile = {
+        **user,  # id, username, display_name
+        "xp": 0,
+        "coins": 0,
+        "level": 1,
+        "streak": 0,
+        "predictions_count": predictions_count,
+        "training_count": training_count,
+        "multiplayer_count": 0,
+        "wiki_lookups": 0,
+        "wins": 0,
+        "losses": 0,
+        "next_level_xp": 100,
+        "level_progress": 0,
+        "achievements": [],
+    }
     
     return {
         "message": f"Welcome back, {user['display_name']}!",
         "user": user,
-        "dashboard": {
-            "user": user,
-            "predictions_count": pred_count,
-            "training_count": train_count,
-        },
+        "dashboard": DashboardData(
+            user=user_profile,
+            leaderboard=[],
+            missions=[],
+            achievements=[],
+            recent_activity=[],
+            correct_guesses=[],
+            model_status={
+                "ready": training_count > 0,
+                "classes": trained_classes,
+            },
+        ).model_dump(),
     }
 
 
@@ -369,17 +417,51 @@ async def get_dashboard(request: Request):
     cursor = conn.cursor()
     
     cursor.execute("SELECT COUNT(*) FROM predictions WHERE user_id = ?", (user["id"],))
-    pred_count = cursor.fetchone()[0]
+    predictions_count = cursor.fetchone()[0]
     
     cursor.execute("SELECT COUNT(*) FROM training_logs WHERE user_id = ?", (user["id"],))
-    train_count = cursor.fetchone()[0]
+    training_count = cursor.fetchone()[0]
     
     conn.close()
     
+    # Get trained classes for model status
+    trained_classes = []
+    if training_count > 0:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT class_name FROM training_logs WHERE user_id = ?", (user["id"],))
+        trained_classes = [row[0] for row in cursor.fetchall()]
+        conn.close()
+    
+    # Build complete user profile
+    user_profile = {
+        **user,  # id, username, display_name
+        "xp": 0,
+        "coins": 0,
+        "level": 1,
+        "streak": 0,
+        "predictions_count": predictions_count,
+        "training_count": training_count,
+        "multiplayer_count": 0,
+        "wiki_lookups": 0,
+        "wins": 0,
+        "losses": 0,
+        "next_level_xp": 100,
+        "level_progress": 0,
+        "achievements": [],
+    }
+    
     return DashboardData(
-        user=user,
-        predictions_count=pred_count,
-        training_count=train_count,
+        user=user_profile,
+        leaderboard=[],
+        missions=[],
+        achievements=[],
+        recent_activity=[],
+        correct_guesses=[],
+        model_status={
+            "ready": training_count > 0,
+            "classes": trained_classes,
+        },
     ).model_dump()
 
 
