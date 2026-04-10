@@ -331,6 +331,7 @@ def _build_room_state_payload(room: dict[str, Any], viewer_user_id: int) -> dict
                 "display_name": player["display_name"],
                 "score": int(player.get("score", 0)),
                 "is_drawer": user_id == drawer_user_id,
+                "has_guessed": bool(player.get("has_guessed", False)),
             }
             for user_id, player in players.items()
         ],
@@ -467,6 +468,9 @@ async def _start_round(room_id: str) -> None:
     room["round_number"] = int(room.get("round_number", 0)) + 1
     room["round_ends_at"] = _utc_now() + timedelta(seconds=ROUND_DURATION_SECONDS)
     room["prompt"] = random.choice(PROMPT_WORDS)
+
+    for player in room.get("players", {}).values():
+        player["has_guessed"] = False
 
     event = {
         "kind": "round",
@@ -1509,6 +1513,7 @@ async def join_room(sid: str, data: dict[str, Any]) -> None:
             "username": session["username"],
             "display_name": session["display_name"],
             "score": 0,
+            "has_guessed": False,
         }
         room["player_order"].append(user_id)
     else:
@@ -1608,8 +1613,11 @@ async def submit_guess(sid: str, data: dict[str, Any]) -> None:
     if user_id == room.get("drawer_user_id"):
         return
 
-    is_correct = guess.lower() == str(room.get("prompt", "")).lower()
     player = room.get("players", {}).get(user_id)
+    if player is not None:
+        player["has_guessed"] = True
+
+    is_correct = guess.lower() == str(room.get("prompt", "")).lower()
     display_name = player["display_name"] if player else session["display_name"]
 
     if is_correct:

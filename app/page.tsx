@@ -154,6 +154,7 @@ type MultiplayerPlayer = {
   display_name: string;
   score: number;
   is_drawer: boolean;
+  has_guessed: boolean;
 };
 
 type MultiplayerRoomMessage = {
@@ -163,6 +164,7 @@ type MultiplayerRoomMessage = {
   prediction?: string;
   confidence?: number;
   correct?: boolean;
+  reason?: string;
   user?: { display_name?: string; username?: string } | null;
 };
 
@@ -184,12 +186,23 @@ type MultiplayerRoomState = {
   self: { user_id: number; display_name: string; username: string } | null;
 };
 
-function useSocketMessages(roomId: string | null, enabled: boolean) {
+function useSocketMessages(
+  roomId: string | null,
+  enabled: boolean,
+  handlers?: {
+    onRoomEvent?: (payload: MultiplayerRoomMessage) => void;
+  },
+) {
   const [messages, setMessages] = useState<string[]>([]);
   const [remoteStroke, setRemoteStroke] = useState<{ x: number; y: number } | null>(null);
   const [clearSignal, setClearSignal] = useState(0);
   const [roomState, setRoomState] = useState<MultiplayerRoomState | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const handlersRef = useRef(handlers);
+
+  useEffect(() => {
+    handlersRef.current = handlers;
+  }, [handlers]);
 
   useEffect(() => {
     if (!enabled || !roomId) {
@@ -217,6 +230,7 @@ function useSocketMessages(roomId: string | null, enabled: boolean) {
     socket.on("room_event", (payload: MultiplayerRoomMessage) => {
       const suffix = payload.kind === "guess" && payload.correct === false ? " (incorrect)" : "";
       setMessages((prev) => [...prev, `${payload.message}${suffix}`]);
+      handlersRef.current?.onRoomEvent?.(payload);
     });
 
     socket.on("ai_chat_message", (payload: {
@@ -311,10 +325,38 @@ export default function Home() {
   const [classSamples, setClassSamples] = useState<number[][][]>([]);
   const [samplesLoading, setSamplesLoading] = useState(false);
 
+  const roomStateRef = useRef<MultiplayerRoomState | null>(null);
+
   const { socketRef, messages, setMessages, remoteStroke, clearSignal, roomState } = useSocketMessages(
     activeRoomId,
     Boolean(session) && playMode === "multiplayer",
+    {
+      onRoomEvent: useCallback(
+        (payload: MultiplayerRoomMessage) => {
+          if (payload.kind === "guess" && payload.correct === true) {
+            const displayName = payload.user?.display_name ?? "A player";
+            const isSelf = Boolean(session && payload.user?.username === session.user.username);
+            setToast(isSelf ? "You guessed correctly!" : `${displayName} guessed correctly!`);
+            return;
+          }
+
+          if (payload.kind === "round" && payload.reason === "time up") {
+            const isDrawer = roomStateRef.current?.is_drawer ?? false;
+            setToast(
+              isDrawer
+                ? "Time's up. Round ended before a guess was made."
+                : "Time's up. You couldn't guess in time.",
+            );
+          }
+        },
+        [session],
+      ),
+    },
   );
+
+  useEffect(() => {
+    roomStateRef.current = roomState;
+  }, [roomState]);
 
   const refreshDashboard = useCallback(async (options?: { silent?: boolean }) => {
     if (!options?.silent) {
@@ -1307,6 +1349,24 @@ export default function Home() {
                       Send Guess
                     </button>
                   </div>
+
+                  <p className="mt-3 text-xs font-medium text-slate-500">
+                    {roomState?.self
+                      ? (() => {
+                          const selfPlayer = roomState.players.find(
+                            (player) => player.user_id === roomState.self?.user_id,
+                          );
+
+                          if (!selfPlayer || selfPlayer.is_drawer) {
+                            return "Your status: drawing this round";
+                          }
+
+                          return selfPlayer.has_guessed
+                            ? "Your status: you have already guessed this round"
+                            : "Your status: you have not guessed yet";
+                        })()
+                      : ""}
+                  </p>
                 </>
               ) : (
                 <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
@@ -1342,6 +1402,13 @@ export default function Home() {
                             {player.is_drawer ? " · drawing" : ""}
                           </p>
                           <p className="text-xs text-slate-500">@{player.username}</p>
+                          <p className="mt-1 text-xs font-medium text-slate-500">
+                            {player.is_drawer
+                              ? "Drawing this round"
+                              : player.has_guessed
+                                ? "Has guessed"
+                                : "Has not guessed yet"}
+                          </p>
                         </div>
                         <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
                           {player.score} pts
